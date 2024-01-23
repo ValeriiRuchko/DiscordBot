@@ -2,30 +2,17 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"text/template"
 
-	"github.com/diamondburned/arikawa/v3/api"
-	"github.com/diamondburned/arikawa/v3/api/cmdroute"
-	"github.com/diamondburned/arikawa/v3/gateway"
-	"github.com/diamondburned/arikawa/v3/state"
-	"github.com/diamondburned/arikawa/v3/utils/json/option"
+	"github.com/bwmarrin/discordgo"
 )
-
-// here we define which command our bot has
-var commands = []api.CreateCommandData{{
-	Name:        "get-weather",
-	Description: "Fetch weather from data-source!",
-}}
-
-// declaring variable which helps to answer to Discord "slash commands"
-var r *cmdroute.Router = cmdroute.NewRouter()
 
 type WeatherItem struct {
 	Id          int
@@ -53,7 +40,7 @@ func main() {
 
 	// getting pointer to response struct, and to get res.Body, we then have to
 	// read it with io.ReadAll (it gives array of bytes so we have to convert it to string
-	// to further parse and unparse as JSON) and after use close with defer res.Body.close()
+	// to further parse and unparse as JSON) and after use close with "defer res.Body.close()"
 	// (because in Go Body is like stream I guess)
 	res, err := http.Get(weatherApi)
 	if err != nil {
@@ -65,10 +52,10 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	// body version converted from []byte which we can print and parse to and from JSON
-	stringBody := string(body)
-	// need to be pointer so that we can write to it parsed JSON data
-	var parsedJSON *ParsedBody
+
+	// stringifiedBody := string(body)
+
+	var parsedJSON ParsedBody
 
 	err = json.Unmarshal(body, &parsedJSON)
 	if err != nil {
@@ -78,13 +65,13 @@ func main() {
 	// defer closing of Body stream of bytes until the function returns
 	defer res.Body.Close()
 
-	fmt.Println(parsedJSON.Weather[0].Main, stringBody)
 	// what we send to Discord bot
 	weatherReport := template.New("weatherReport")
+
 	weatherReport.Parse(`Temp is {{.Main.Temp}} & Weather is {{$weather := index .Weather 0}}{{$weather.Main}}`)
 
 	// intermediate buffer that implements io.Writer so can be used in weatherReport.Execute
-	// (need to allocate with new so that buffer wouldn't point to nil)
+	// (need to allocate with "new" so that buffer wouldn't point to nil)
 	buf := new(bytes.Buffer)
 	// finally giving our buffer with info
 	err = weatherReport.Execute(buf, parsedJSON)
@@ -92,25 +79,46 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	// fmt.Println(stringBody)
-	// handler function which handles command "/get-weather (names must be the same)"
-	r.AddFunc("get-weather", func(ctx context.Context, data cmdroute.CommandData) *api.InteractionResponseData {
-		return &api.InteractionResponseData{Content: option.NewNullableString(buf.String())}
+	// bot initialization
+	sess, err := discordgo.New("Bot " + os.Getenv("DISCORD_TOKEN"))
+	if err != nil {
+		log.Fatalln("Initialization of bot failed", err)
+	}
+
+	// ----- ----- ----- ----- ----- -----
+	// NECESSARY ACTIONS TO ADD NEW "SLASH COMMAND"
+	command := discordgo.ApplicationCommand{Name: "get-weather", Description: "Get current weather information"}
+
+	getHandler := func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: buf.String(),
+			},
+		})
+		fmt.Println("Handled")
+	}
+	// register interaction handler
+	sess.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		getHandler(s, i)
 	})
+	// register interaction
+	sess.ApplicationCommandCreate(os.Getenv("APP_ID"), "", &command)
 
-	// connecting to our bot with unique bot-token
-	s := state.New("Bot " + os.Getenv("DISCORD_TOKEN"))
-	// permissions and description of actions of our bot
-	s.AddInteractionHandler(r)
-	s.AddIntents(gateway.IntentGuilds)
+	// ----- ----- ----- ----- ----- -----
 
-	fmt.Println("Bot started")
-
-	if err := cmdroute.OverwriteCommands(s, commands); err != nil {
-		log.Fatalln("cannot update commands:", err)
+	err = sess.Open()
+	if err != nil {
+		log.Fatalln("Couldn't open the session", err)
 	}
 
-	if err := s.Connect(context.TODO()); err != nil {
-		log.Println("cannot connect:", err)
-	}
+	defer sess.Close()
+
+	// so the program won't close, wtf
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	log.Println("Press Ctrl+C to exit")
+	<-stop
+
+	fmt.Println("Bot is up and running")
 }
